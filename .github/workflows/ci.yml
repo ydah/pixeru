@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PICORUBY_DIR: /tmp/picoruby
+  PICORUBY_REF: master
+
+jobs:
+  test-cruby:
+    name: CRuby ${{ matrix.ruby }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.1", "3.2", "3.3", "3.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - name: Smoke test gem entrypoint
+        run: ruby -I lib -e 'require "pixeru"; puts Pixeru::VERSION'
+      - name: Run tests
+        run: |
+          for f in test/test_*.rb; do
+            echo "=== $f ==="
+            ruby -I lib -I test "$f"
+          done
+
+  package:
+    name: Package Gem
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Build gem package
+        run: gem build pixeru.gemspec
+      - name: Inspect packaged files
+        run: |
+          ruby -rrubygems/package -e 'spec = Gem::Package.new("pixeru-0.1.0.gem").spec; puts spec.files.sort'
+      - name: Upload gem artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixeru-gem
+          path: pixeru-0.1.0.gem
+
+  test-picoruby:
+    name: PicoRuby POSIX
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PIXERU_REPO: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc make git libssl-dev
+      - name: Checkout PicoRuby
+        run: |
+          git clone --depth 1 --branch "$PICORUBY_REF" https://github.com/picoruby/picoruby.git "$PICORUBY_DIR"
+          git -C "$PICORUBY_DIR" submodule update --init --depth 1 --recursive \
+            mrbgems/mruby-bin-mrbc2 \
+            mrbgems/mruby-compiler2 \
+            mrbgems/picoruby-mruby/lib/estalloc \
+            mrbgems/picoruby-mruby/lib/mruby \
+            mrbgems/picoruby-mrubyc/lib/mrubyc
+      - name: Write PicoRuby build config
+        run: |
+          cat > "$PICORUBY_DIR/build_config/pixeru-ci.rb" <<'RUBY'
+          MRuby::Build.new do |conf|
+            conf.toolchain
+
+            conf.cc.defines << "PICORUBY_INT64"
+            conf.cc.defines << "MRBC_TICK_UNIT=4"
+            conf.cc.defines << "MRBC_TIMESLICE_TICK_COUNT=3"
+            conf.cc.defines << "MRBC_USE_STRING_UTF8"
+
+            conf.posix
+            conf.picoruby(alloc_libc: true)
+
+            conf.linker.libraries << "ssl"
+            conf.linker.libraries << "crypto"
+
+            conf.gembox "minimum"
+            conf.gembox "core"
+            conf.gembox "stdlib"
+            conf.gem File.expand_path(ENV.fetch("PIXERU_REPO"), __dir__)
+          end
+          RUBY
+      - name: Build PicoRuby with local mrbgem
+        run: |
+          cd "$PICORUBY_DIR"
+          MRUBY_CONFIG=build_config/pixeru-ci.rb rake
+          echo "$PICORUBY_DIR/build/host/bin" >> "$GITHUB_PATH"
+      - name: Smoke test bundled mrbgem
+        run: picoruby -e 'puts Pixeru::VERSION'
+      - name: Run pure Ruby tests on PicoRuby
+        run: |
+          for f in test/test_*.rb; do
+            if [ "$f" = "test/test_entry_point.rb" ]; then
+              continue
+            fi
+            echo "=== $f ==="
+            picoruby -I "$GITHUB_WORKSPACE/lib" -I "$GITHUB_WORKSPACE/test" "$GITHUB_WORKSPACE/$f"
+          done
